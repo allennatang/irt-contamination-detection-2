@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: icd2
+Version: 0.1.0
+Summary: IRT-based contamination detection, v2
+Requires-Python: >=3.10
+Requires-Dist: numpy==2.2.6
+Requires-Dist: scipy==1.15.3
+Requires-Dist: scikit-learn==1.7.2
+Requires-Dist: pandas==2.3.3
+Requires-Dist: torch==2.13.0
+Requires-Dist: transformers==5.14.1
+Requires-Dist: peft==0.20.0
+Requires-Dist: bitsandbytes==0.50.0
+Requires-Dist: datasets==5.0.1
+Requires-Dist: huggingface-hub==1.27.0
+Requires-Dist: accelerate==1.14.0
+Requires-Dist: tokenizers==0.22.2
+Requires-Dist: safetensors==0.8.0
+Requires-Dist: trl==1.9.2
+Requires-Dist: fluid-benchmarking==0.1.0
+Provides-Extra: dev
+Requires-Dist: pytest==9.1.1; extra == "dev"
+Requires-Dist: ipykernel==7.3.0; extra == "dev"
