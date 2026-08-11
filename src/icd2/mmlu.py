@@ -6,25 +6,32 @@ Two jobs:
    (`choices` list + integer `answer`) and this project's local schema
    (`A/B/C/D` + letter `answer`), and render an item as chat messages.
 
-2. Stratified item-set construction -- build the MEMBER and NONMEMBER sets
-   *jointly* from the same pool so they are matched on both subject and item
-   difficulty.
+2. Stratified item-set construction -- build the MEMBER, NONMEMBER and ANCHOR
+   sets *jointly* from the whole MMLU test set, so all three are matched on
+   subject and item difficulty.
 
-Design (why both sets are built together):
-    Members are the items the model gets contaminated on; nonmembers are the
-    held-out control. If the two sets differed in subject or difficulty, a
-    detector could separate them on that confound instead of on membership.
-    So we take every MMLU test item in a fixed set of subjects, attach each
-    item's prefit 2PL difficulty `b` (from allenai/fluid-benchmarking, matched
-    per item as `mmlu_<subject>_<position>`), bin difficulty within each
-    subject, and split every (subject x difficulty-bin) stratum 50/50 into
-    members and nonmembers. The two groups then have the same subject mix and
-    (up to bin resolution) the same difficulty distribution by construction,
-    and every pooled item is used exactly once.
+Design (why all three sets are built together):
+    MEMBER items are the ones the model gets contaminated on. NONMEMBER is the
+    matched clean control it is contrasted against. ANCHOR is a third clean set,
+    held out of both, whose only job is to supply the ability estimate theta-hat
+    that MEMBER and NONMEMBER residuals are measured against.
+
+    If MEMBER and NONMEMBER differed in subject or difficulty, a detector could
+    separate them on that confound instead of on membership. So we take every
+    item in the prefit bank (= the whole MMLU test set, 14,042 items across 57
+    subjects), bin difficulty `b` into quartiles *within* each subject, and
+    allocate inside each (subject x difficulty-bin) stratum. All three sets then
+    have the same subject mix and the same difficulty distribution by
+    construction, and every item is used exactly once.
+
+    ANCHOR must be disjoint from both tested sets, not merely uncontaminated:
+    if theta-hat were fit on the items being tested, the estimator would shrink
+    those items' residuals toward zero and the contrast would measure the
+    estimator rather than the contamination.
 
 The prefit item parameters are never refit -- 2PL a/b come from allenai's model
 fit across a large population of unrelated LMs (see irt.py / the tier-0
-regression test). We only *read* difficulty `b` here to stratify on it.
+regression test). We only *read* `b` here to stratify on it.
 """
 
 import argparse
@@ -44,17 +51,14 @@ SYSTEM_PROMPT = (
     "The following is a multiple-choice question. Please choose the most suitable one among A, B, C and D as the answer to this question.\n\n"
 )
 
-# The subjects the pool is drawn from. Both members and nonmembers come from
-# these same subjects, so subject can be matched between the two groups (unlike
-# the v1 design, where members were whole subjects and nonmembers necessarily
-# came from disjoint ones).
-MEMBER_SUBJECTS = [
-    "abstract_algebra",
-    "econometrics",
-    "international_law",
-    "college_medicine",
-    "computer_security",
-]
+# Assignment values written to the split manifest. MEMBER and NONMEMBER are the
+# two contrasted sets; ANCHOR supplies theta-hat and is tested by neither.
+MEMBER = "MEMBER"
+NONMEMBER = "NONMEMBER"
+ANCHOR = "ANCHOR"
+
+# Expected size of the item universe (= rows in the prefit bank = MMLU test).
+N_ITEMS = 14042
 
 
 # --------------------------------------------------------------------------- #
@@ -95,7 +99,7 @@ def load_irt_bank():
     within its subject's block of the live `cais/mmlu` test split. 14,042 rows
     == the full MMLU test set.
 
-    Produces a Dataframe indexed by item ids.
+    Produces a DataFrame indexed by item ids.
     """
     path = hf_hub_download(
         repo_id="allenai/fluid-benchmarking",
@@ -107,174 +111,260 @@ def load_irt_bank():
     return pd.read_csv(path, index_col=0)
 
 
-def load_pool(subjects):
-    """All live MMLU test items in `subjects`, each tagged with its item id and
-    prefit difficulty.
+def bank_subjects(bank):
+    """The subject of every bank row, parsed out of the item id.
+
+    `mmlu_<subject>_<position>` -> `<subject>`; rsplit on the final underscore
+    so multi-word subjects like `college_computer_science` survive intact.
+    """
+    return bank.index.str.rsplit("_", n=1).str[0].str.removeprefix("mmlu_")
+
+
+def load_pool(bank, subjects=None):
+    """Every live MMLU test item, tagged with its item id and prefit a/b.
 
     Returns a list of local-schema dicts, each additionally carrying:
         item_id -- `mmlu_<subject>_<position>`
         a, b    -- prefit 2PL discrimination / difficulty from the bank
 
     The per-subject position is assigned from the *filtered* "all"-config pull,
-    whose row order matches the ordering the bank ids were built against
-    (filter() preserves order). Items whose id has no bank match, or that
-    collide on an id via a duplicate stem within a subject, are dropped
-    (keeping the first occurrence) so item_id stays a unique key.
+    whose row order matches the ordering the bank ids were built against. The
+    dataset is walked ONCE and bucketed by subject; walking it per subject would
+    mean 57 full passes.
 
-    Notes:
-    - creates own item-id based on its position in the mmlu set.
-    - consumes the DataFrame produced by load_irt_bank by looking it up in bank.index and attaching a/b parameters.
+    `subjects` defaults to every subject in the bank. item_id is unique by
+    construction (subject + enumerate position), so no de-duplication is needed;
+    an id missing from the bank means the dataset row order has drifted, which
+    is a hard error rather than something to drop silently.
     """
-    hf_data = load_dataset("cais/mmlu", "all", split="test")
-    bank = load_irt_bank()
+    if subjects is None:
+        subjects = sorted(set(bank_subjects(bank)))
+    wanted = set(subjects)
+
+    # One pass over the dataset, bucketed by subject. `load_dataset` preserves
+    # the on-disk row order, which is the order the bank ids were built against.
+    by_subject = {}
+    for row in load_dataset("cais/mmlu", "all", split="test"):
+        if row["subject"] in wanted:
+            by_subject.setdefault(row["subject"], []).append(row)
 
     pool = []
-    seen_ids = set()
-    n_no_bank = 0
-    n_dupe = 0
-    for subject in subjects:
-        subj_rows = [row for row in hf_data if row["subject"] == subject]
-        for position, row in enumerate(subj_rows):
-
-            # Reconstructing the item id
+    missing = []
+    for subject in sorted(wanted):
+        for position, row in enumerate(by_subject.get(subject, [])):
             item_id = f"mmlu_{subject}_{position}"
             if item_id not in bank.index:
-                n_no_bank += 1
+                missing.append(item_id)
                 continue
-            if item_id in seen_ids:
-                n_dupe += 1
-                continue
-            seen_ids.add(item_id)
             example = hf_mmlu_to_local(row)
             example["item_id"] = item_id
             example["a"] = float(bank.at[item_id, "a"])
             example["b"] = float(bank.at[item_id, "b"])
             pool.append(example)
 
-    if n_no_bank:
-        print(f"  WARNING: {n_no_bank} items had no entry in the prefit bank; dropped.")
-    if n_dupe:
-        print(f"  WARNING: {n_dupe} items collided on item_id (duplicate stem); kept first.")
+    # Positional ids are the one silent-failure mode here: if HF ever reorders
+    # `cais/mmlu`, every id shifts and the a/b attached to each item is wrong.
+    # A missing id is the observable symptom, so refuse to continue.
+    if missing:
+        raise ValueError(
+            f"{len(missing)} item ids are absent from the prefit bank "
+            f"(first: {missing[:3]}). The cais/mmlu row order no longer matches "
+            f"the order the bank ids were built against; pin the datasets version."
+        )
     return pool
 
 
-def _assign_difficulty_bins(pool, n_bins):
-    """Add a `diff_bin` (0..n_bins-1) to each pool item, binned *within* its
+def assign_difficulty_bins(pool, n_bins=4):
+    """Add a `difficulty_bin` (0..n_bins-1) to each item, binned *within* its
     subject by difficulty rank so each (subject, bin) stratum is near-equal size.
 
-    Binning within subject (rather than on a global b threshold) keeps every
+    Binning within subject (rather than on a global `b` threshold) keeps every
     stratum well populated and still yields matched difficulty distributions
-    between members and nonmembers, since each stratum is split 50/50. Bin 0 is
-    the easiest (lowest b) items in the subject.
+    across the three sets, since every stratum is allocated the same way. Bin 0
+    is the easiest (lowest b) items in the subject.
+
+    Rank-based splitting is the `duplicates="drop"` case of pd.qcut handled by
+    construction: ties in `b` cannot collapse a bin, because np.array_split
+    divides positions, not values. Returns the number of bins actually used per
+    subject, so a subject too small for n_bins is visible rather than silent.
     """
     by_subject = {}
     for item in pool:
         by_subject.setdefault(item["subject"], []).append(item)
 
-    for items in by_subject.values():
+    bins_used = {}
+    for subject, items in by_subject.items():
         order = sorted(range(len(items)), key=lambda i: items[i]["b"])
+        n_used = min(n_bins, len(items))
         # np.array_split gives near-equal groups even when len isn't divisible.
-        for bin_idx, group in enumerate(np.array_split(order, min(n_bins, len(items)))):
+        for bin_idx, group in enumerate(np.array_split(order, n_used)):
             for i in group:
-                items[i]["diff_bin"] = bin_idx
+                items[i]["difficulty_bin"] = int(bin_idx)
+        bins_used[subject] = n_used
+    return bins_used
 
 
-def stratified_member_split(subjects=None, n_bins=4, seed=0):
-    """Build matched member / nonmember sets by a 50/50 split within each
-    (subject x difficulty-bin) stratum.
+def stratified_three_way_split(pool, p=0.20, seed=0):
+    """Allocate every pooled item to MEMBER / NONMEMBER / ANCHOR.
 
-    Every pooled item is assigned to exactly one group, so
-    members + nonmembers == the whole pool. Odd-sized strata alternate which
-    group receives the extra item, keeping the group totals balanced. Each
-    returned item carries a `label` (1 = member, 0 = nonmember) alongside its
-    item_id / a / b / diff_bin.
+    Within each (subject, difficulty_bin) stratum: shuffle with a fixed seed,
+    take k = round(p * n_stratum) for MEMBER, the NEXT k for NONMEMBER, and give
+    the remainder to ANCHOR.
 
-    Returns (members, nonmembers).
+    Taking two equal slices per stratum makes |MEMBER| == |NONMEMBER| hold
+    exactly with no largest-remainder bookkeeping, *and* makes a within-stratum
+    permutation null valid by construction -- assignment really was exchangeable
+    inside each stratum.
+
+    Mutates each item in `pool` with an `assignment` key and returns the pool.
     """
-    if subjects is None:
-        subjects = MEMBER_SUBJECTS
-    pool = load_pool(subjects)
-    _assign_difficulty_bins(pool, n_bins)
+    if not 0 < p <= 0.5:
+        raise ValueError(f"p must be in (0, 0.5]; got {p}")
 
     strata = {}
     for idx, item in enumerate(pool):
-        strata.setdefault((item["subject"], item["diff_bin"]), []).append(idx)
+        strata.setdefault((item["subject"], item["difficulty_bin"]), []).append(idx)
 
     rng = np.random.default_rng(seed)
-    members, nonmembers = [], []
-    extra_to_member = True
     for key in sorted(strata):  # deterministic stratum order
         idx = strata[key]
+        k = int(round(p * len(idx)))
+        # Below p ~ 0.10 the smallest strata round to k=0 and would vanish with
+        # no message, taking their whole (subject, difficulty) cell out of both
+        # tested sets. Fail loudly instead.
+        if k < 1:
+            raise ValueError(
+                f"stratum {key} has {len(idx)} items; k=round({p}*{len(idx)})=0. "
+                f"Raise p, or use fewer difficulty bins."
+            )
         rng.shuffle(idx)  # in-place, seeded
-        half = len(idx) // 2
-        if len(idx) % 2 == 0:
-            cut = half
-        else:
-            cut = half + 1 if extra_to_member else half
-            extra_to_member = not extra_to_member
-        for i in idx[:cut]:
-            pool[i]["label"] = 1
-            members.append(pool[i])
-        for i in idx[cut:]:
-            pool[i]["label"] = 0
-            nonmembers.append(pool[i])
+        for i in idx[:k]:
+            pool[i]["assignment"] = MEMBER
+        for i in idx[k:2 * k]:
+            pool[i]["assignment"] = NONMEMBER
+        for i in idx[2 * k:]:
+            pool[i]["assignment"] = ANCHOR
 
-    return members, nonmembers
+    return pool
+
+
+def build_split(p=0.20, n_bins=4, seed=0, subjects=None):
+    """Full Stage 1 pipeline: bank -> pool -> difficulty bins -> three-way split.
+
+    Returns (pool, bins_used). Every item carries item_id, subject, a, b,
+    difficulty_bin and assignment.
+    """
+    bank = load_irt_bank()
+    pool = load_pool(bank, subjects=subjects)
+    if subjects is None and len(pool) != N_ITEMS:
+        raise ValueError(f"expected {N_ITEMS} pooled items, got {len(pool)}")
+    bins_used = assign_difficulty_bins(pool, n_bins=n_bins)
+    stratified_three_way_split(pool, p=p, seed=seed)
+    return pool, bins_used
+
+
+# --------------------------------------------------------------------------- #
+# Manifest I/O
+# --------------------------------------------------------------------------- #
+MANIFEST_COLS = ["item_id", "subject", "a", "b", "difficulty_bin", "assignment"]
+
+
+def split_frame(pool):
+    """The pool as a manifest DataFrame, sorted by item_id for a stable diff."""
+    df = pd.DataFrame([{k: item[k] for k in MANIFEST_COLS} for item in pool])
+    return df.sort_values("item_id").reset_index(drop=True)
+
+
+def items_for(pool, assignment):
+    """Every pooled item with the given assignment, in pool order."""
+    return [item for item in pool if item["assignment"] == assignment]
+
+
+def load_split(path):
+    """Read a frozen manifest back. The manifest is the ONLY source of labels.
+
+    Every downstream stage keys on this file so contamination, scoring and the
+    detectors cannot disagree about which items are members.
+
+    `float_precision="round_trip"` is required, not cosmetic: the C parser's
+    default float conversion is not correctly rounded, so a/b would come back
+    ~1e-15 off the values written even though the file holds 17 significant
+    digits. With it, a reloaded manifest compares equal to a freshly built one.
+    """
+    return pd.read_csv(path, float_precision="round_trip")
 
 
 # --------------------------------------------------------------------------- #
 # CLI: freeze a split to disk so contamination + analysis use the same items
 # --------------------------------------------------------------------------- #
-# Contamination run: takes the members and fine-tunes on them
-# Analysis: scores every item, based on item's score with its ground-truth membership label.
-# They need to share the same ground-truth labels!
+def _report(pool, bins_used, p):
+    """Print the Stage 1 verification table."""
+    df = split_frame(pool)
+    counts = df["assignment"].value_counts()
+    print(f"\n  items {len(df)}   subjects {df['subject'].nunique()}   "
+          f"strata {df.groupby(['subject', 'difficulty_bin']).ngroups}")
+    for name in (MEMBER, NONMEMBER, ANCHOR):
+        print(f"    {name:<10} {counts.get(name, 0)}")
 
-def _write_split(members, nonmembers, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "members.json"), "w", encoding="utf-8") as f:
-        json.dump(members, f, indent=2)
-    with open(os.path.join(out_dir, "nonmembers.json"), "w", encoding="utf-8") as f:
-        json.dump(nonmembers, f, indent=2)
-    # Audit manifest: one row per item with the fields that define the split.
-    rows = [
-        {k: item[k] for k in ("item_id", "subject", "b", "diff_bin", "label")}
-        for item in members + nonmembers
-    ]
-    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "manifest.csv"), index=False)
+    short = {s: n for s, n in bins_used.items() if n < 4}
+    if short:
+        print(f"  NOTE: {len(short)} subject(s) had fewer than 4 bins: {short}")
+
+    # Balance table. a/b are stratified on, so they must match; item length is
+    # NOT stratified on and is only balanced in expectation -- a real check,
+    # aimed at zlib's text-length confound.
+    length = {item["item_id"]: len(item["question"]) + sum(len(item[c]) for c in CHOICES)
+              for item in pool}
+    df["length"] = df["item_id"].map(length)
+    print("\n  balance (mean +/- sd):")
+    print(f"    {'set':<10} {'a':>15} {'b':>15} {'length':>15}")
+    for name in (MEMBER, NONMEMBER, ANCHOR):
+        g = df[df["assignment"] == name]
+        print(f"    {name:<10} {g['a'].mean():>7.3f}+/-{g['a'].std():<6.3f} "
+              f"{g['b'].mean():>7.3f}+/-{g['b'].std():<6.3f} "
+              f"{g['length'].mean():>7.1f}+/-{g['length'].std():<6.1f}")
+
+    # Gates from the guide's Stage 1 "Verify" list.
+    assert counts.get(MEMBER, 0) == counts.get(NONMEMBER, 0), "member/nonmember sizes differ"
+    assert len(df) == len(set(df["item_id"])), "duplicate item_id"
+    assert set(counts.index) == {MEMBER, NONMEMBER, ANCHOR}, "unexpected assignment value"
+    print("\n  gates: sizes equal, ids unique, three assignments -- PASS")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--tag", default="stratified",
-        help="Output subdir under data/ (default: stratified -> data/stratified/).",
-    )
+    parser = argparse.ArgumentParser(description="Build the Stage 1 stratified split.")
+    parser.add_argument("--tag", default="v2",
+                        help="Output subdir under data/splits/ (default: v2).")
+    parser.add_argument("--p", type=float, default=0.20,
+                        help="Fraction of each stratum per tested set (default: 0.20).")
     parser.add_argument("--n-bins", type=int, default=4,
                         help="Difficulty bins per subject (default: 4).")
     parser.add_argument("--seed", type=int, default=0,
-                        help="Shuffle seed for the within-stratum split (default: 0).")
+                        help="Shuffle seed for the within-stratum allocation (default: 0).")
     parser.add_argument("--force", action="store_true",
-                        help="Overwrite an existing split at data/<tag>/ instead of refusing.")
+                        help="Overwrite an existing split instead of refusing.")
     args = parser.parse_args()
 
-    out_dir = os.path.join(_REPO_ROOT, "data", args.tag)
+    out_dir = os.path.join(_REPO_ROOT, "data", "splits")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"split_{args.tag}_seed{args.seed}.csv")
 
     # A frozen split is meant to be stable -- contamination and analysis both
     # read it, so silently overwriting one would desync ground-truth labels
-    # between stages. Refuse if the target already holds a split, unless --force.
-    _SPLIT_FILES = ("members.json", "nonmembers.json", "manifest.csv")
-    existing = [f for f in _SPLIT_FILES if os.path.exists(os.path.join(out_dir, f))]
-    if existing and not args.force:
+    # between stages. Refuse if the target exists, unless --force.
+    if os.path.exists(out_path) and not args.force:
         raise SystemExit(
-            f"ERROR: {out_dir} already contains a split ({', '.join(existing)}).\n"
-            f"       Refusing to overwrite it. Use a different --tag, or pass "
-            f"--force to overwrite."
+            f"ERROR: {out_path} already exists.\n"
+            f"       Refusing to overwrite it. Use a different --tag/--seed, or "
+            f"pass --force."
         )
 
-    print(f"Building stratified split over {len(MEMBER_SUBJECTS)} subjects "
-          f"({args.n_bins} difficulty bins each, seed={args.seed})...")
-    members, nonmembers = stratified_member_split(n_bins=args.n_bins, seed=args.seed)
-    print(f"  {len(members)} members, {len(nonmembers)} nonmembers")
+    print(f"Building three-way split (p={args.p}, {args.n_bins} bins/subject, "
+          f"seed={args.seed})...")
+    pool, bins_used = build_split(p=args.p, n_bins=args.n_bins, seed=args.seed)
+    _report(pool, bins_used, args.p)
 
-    _write_split(members, nonmembers, out_dir)
-    print(f"Wrote members.json, nonmembers.json, manifest.csv to {out_dir}")
+    # %.17g round-trips float64 exactly, so a reloaded manifest compares equal to
+    # a freshly built one rather than differing at ~1e-16.
+    split_frame(pool).to_csv(out_path, index=False, float_format="%.17g")
+    print(f"\nWrote {out_path}")
