@@ -489,3 +489,258 @@ I checked that the tests fail against a broken version of the code.
 | `round` in place of the floor for k | caught, k becomes 3 and not 2 |
 | `var` without the `-mu^2` term | caught, the difference reaches 15.7 |
 | A sign flip in `zlib_score` | caught by the orientation test |
+
+# 08/11/2026 (sixth entry)
+Wrote `src/icd2/scoring.py`. Added `apply_split` to `mmlu.py`.
+
+## What scoring.py does
+
+It is the only file that loads a model. It uses teacher forcing. Each question
+and its correct answer go through the model in one forward pass. The model
+writes nothing. The code reads the probability of each token that is already
+there, and gives back 24 numbers for each item.
+
+It has six functions: `load_model`, `encode`, `forward_logits`, `score_example`,
+`score_items` and `collect_t_pool`. It also has `check_encoding`, which tests the
+answer position on a CPU with no model.
+
+## A change from v1: bf16 and not 4-bit
+
+v1 used 4-bit quantization. You kept it only to match v1's numbers. You dropped
+the Tier 2 test, so that reason is gone.
+
+The default is now bf16. Quantization adds noise to every log-probability, and
+the log-probability is the quantity that you measure. The `four_bit=True` option
+gives v1's old configuration.
+
+## Checks that pass
+
+| step | result |
+|---|---|
+| `apply_split` on 14,042 items | 2,812 / 2,812 / 8,418 |
+| CPU pre-flight on 14,042 items | 0 prefix failures, 0 letter mismatches |
+| Model load | 32 s, bf16 |
+| Loss assertion on 10 items | passes |
+| All 24 metrics finite | yes |
+| `loss` equals `mink_1.0` | yes |
+| Two runs give the same numbers | yes |
+| Speed | 27.6 items/s, so 8.5 minutes for 14,042 items |
+
+The speed is better than the guide says. The guide says 12 items/s and 20
+minutes. The reason is bf16, which needs no unpacking of 4-bit weights.
+
+## Finding 1: the base model does not answer with a letter
+
+The base model gives the correct letter a very low probability. For the first
+5 items the log-probability is between −11.3 and −17.0. The rank of the correct
+letter is between 26 and 129.
+
+The reason is the format. The model wants to start with the word "To", as in
+"To solve this problem". Its top choice has a probability near 0.97 at every one
+of the 5 items. It does not want to write one letter alone.
+
+This is not a fault. v1's numbers came from the adapter, and that adapter was
+trained on exactly this format. The training taught it to write one letter.
+
+**What this means for your design.** Any adapter that you train on this format
+will learn the format. Then `logp_answer` rises for the MEMBER items **and** for
+the NONMEMBER items. So a comparison of the base model against an adapter mixes
+format learning with memorization.
+
+The MEMBER against NONMEMBER comparison inside one model does not have this
+problem. Both sets get the same benefit from the format. This is one more reason
+why the matched design is correct.
+
+## Finding 2: mink++ is controlled by one position
+
+For the first item, `mink++_1.0` is −505.73. v1's real values go from −0.570 to
++0.176. This is 1000 times outside that range.
+
+I found the cause. One position of the 108 has a variance of 4.3e-7. At that
+position the model was almost certain, and the true next token was a different
+one. So `t` is −35.47 and `mu` is about 0. The z-score is −54,019.
+
+`mink++` takes a **mean** of the z-scores. Thus that one position controls the
+whole item. Without it `mink++_1.0` is −5.61, and with it the value is −505.73.
+
+This behaviour is in v1's code too. I did not make it, and the guards do not
+correct it. But my change to bf16 makes it **more** frequent, because 4-bit
+quantization adds noise and stops a variance that small.
+
+**What to do.** Do nothing for now. D1, D2 and D3 use correctness bits, so they
+are safe. AUROC uses the rank and not the value, so a few extreme items add
+noise but do not invert the result. But measure it: when you score the full set,
+look at the range of `mink++` for MEMBER and for NONMEMBER. If the extreme items
+fall in one class more than the other, say so.
+
+## Still open
+
+- `scoring.py` has no test. `encode`, `answer_position` and `zlib_text` need no
+  model, so a CPU test is possible.
+- `loglik.py` is not written. It gives the correctness bit. Use `load_model`
+  from `scoring.py`.
+- Freeze the output of one small set, and test against it later.
+
+# 08/11/2026 (seventh entry)
+Wrote `src/icd2/loglik.py`. It gives the correctness bit for D1, D2 and D3.
+
+## The method
+
+It scores by log-likelihood. It does not generate text. For each item it builds
+a prompt, adds one option as the continuation, and adds up the log-probability
+of the tokens of that continuation. It does this for all 4 options, and it picks
+the highest one.
+
+The prompt is the system turn and the user turn from `format_messages`. Thus
+`loglik.py` and `scoring.py` use the same prompt tokens.
+
+## Two kinds of continuation
+
+The file supports both kinds. The `mode` option selects one.
+
+| mode | the continuation is |
+|---|---|
+| `letter` (default) | the letter A, B, C or D |
+| `text` | the text of the option |
+
+## Measurement: `letter` is better by 10 points
+
+I scored 300 random items from 54 subjects with the base model.
+
+| mode | sum | token | byte |
+|---|---|---|---|
+| `letter` | 0.590 | 0.590 | 0.590 |
+| `text` | 0.493 | 0.403 | 0.393 |
+
+Chance is 0.250. The published MMLU value for this model is about 0.68, but that
+value uses 5 examples in the prompt. This run uses none.
+
+I made `letter` the default for three reasons:
+
+1. It is 10 points better.
+2. The Stage 4 sculptor needs one answer position. It keeps the winning letter
+   as the argmax of the 4 letters at that position. A continuation of several
+   tokens has no single position, so the correctness-invariance proof does not
+   work with `text`.
+3. The adapter trains on the letter format. Thus the scorer and the training
+   agree.
+
+## A correction to the plan
+
+The plan said that lm-eval-harness and HELM score the text of the option. For
+MMLU they do not. Both score the letter, and both put the 4 options in the
+prompt. The text method with byte normalization belongs to HellaSwag and ARC,
+where the options are free text of different lengths.
+
+This is why the three rules give the same number in `letter` mode. Every letter
+is 1 token and 1 byte, so the normalization does nothing.
+
+## A fault that I found and corrected
+
+I first scored the 4 options as one batch with padding. This looked safe,
+because a causal model reads backwards only, and the padding sits after every
+real token. It also ran 2 times faster.
+
+I tested it against the version with no batch. The sums moved by up to 0.435,
+and 1 prediction of 40 changed. The reason is bf16: the order of the addition
+changes with the size of the batch, and a sum over a continuation collects that
+error. A change of 2.5 percent in the correctness bit would go into every IRT
+estimate.
+
+The file now scores one option at a time. That path gives the same numbers on a
+second run.
+
+## The measurements
+
+| check | result |
+|---|---|
+| `score_choices` gives the same numbers twice | yes |
+| `letter` mode, 200 random items | 0.595 for all 3 rules |
+| `text` mode, 200 random items | 0.510 / 0.415 / 0.395 |
+| The 3 rules agree in `letter` mode | yes |
+| `correctness_vector` output | 200 values, float64 |
+| Speed | 7.4 items/s, so 32 minutes for 14,042 items |
+
+The speed is 4 times slower than `scoring.py`, because each item needs 4 forward
+passes and not 1.
+
+## Still open
+
+- `loglik.py` and `scoring.py` have no test.
+- Score the base model on all 14,042 items, and freeze the output.
+- Train the adapter on the 2,812 MEMBER items.
+
+# 08/11/2026 (eighth entry)
+Wrote tests for `scoring.py` and `loglik.py`. The suite now holds 90 tests.
+
+    .venv/bin/python -m pytest tests/ -q      # 90 tests, 6 s
+
+The tests need no GPU, no network and no model cache. I checked that they pass
+with the network switched off.
+
+## The method: fake a tokenizer and fake a model
+
+Both scorers do little arithmetic. `mia.py` holds the mathematics, and
+`test_mia.py` tests it. The two scorers cut and join arrays, and a wrong cut is
+silent. A cut does not care which model made the logits.
+
+So `tests/conftest.py` holds three stubs:
+
+| stub | what it does |
+|---|---|
+| `FakeTokenizer` | One token for each character. Its chat template gives a correct prefix. |
+| `BrokenTemplateTokenizer` | Its full output is not a prefix of its prompt. |
+| `OffsetAnswerTokenizer` | The prefix is correct, but a stray token moves the answer by one place. |
+| `FakeModel` | Gives logits of the correct shape and a `.loss` that you can control. |
+
+`OffsetAnswerTokenizer` is the worst fault of the three. The prefix assertion
+still passes, so `encode` raises nothing. But the token at `n_prompt` is no
+longer the answer letter, and every answer metric then reads the wrong place.
+`check_encoding` is the only guard against it.
+
+## What the tests check
+
+`tests/test_scoring.py` holds 17 tests. It checks the answer position, the text
+that zlib compresses, and the three results of `encode`. It checks that
+`score_example` gives the 24 published names, that it gives the same numbers
+twice, and that the loss assertion fires on a wrong shift and stays quiet under
+a transform. It checks that the transform seam gets a 3-D tensor, the item ids
+and `n_prompt`, and that a transform changes the numbers.
+
+`tests/test_loglik.py` holds 22 tests. It checks both modes, both error
+messages, and that all 4 options share one prompt. It checks that a letter is 1
+token and 1 byte, which is the reason the 3 rules agree in `letter` mode. It
+checks `_continuation_logprob` against an exact value, and it checks that the
+function reads the correct positions and ignores the prompt. It checks that
+`score_choices` runs 4 forward passes with a batch of 1, and that the transform
+gets a 2-D tensor.
+
+One test needs the real tokenizer. It checks that Llama's own chat template
+still gives a correct prefix. It skips itself if the tokenizer is absent, so the
+suite stays offline.
+
+## The tests have teeth
+
+I broke the code 4 ways and ran the suite each time.
+
+| fault | result |
+|---|---|
+| The continuation shift moves by one | caught |
+| The gold tokens move by one | caught |
+| The loss assertion is switched off | caught |
+| The answer position moves by one | caught |
+
+## One test of mine was wrong
+
+I first tested a letter mismatch by setting a wrong `answer` on the item. The
+test failed. The reason is that `format_messages` builds the assistant turn
+**from** `answer`. Thus the served letter and the gold letter can never differ.
+
+A mismatch needs a tokenizer that moves the answer. That is why
+`OffsetAnswerTokenizer` exists. The test now uses it, and it is a better test,
+because it copies the real fault.
+
+## Still open
+
+- Score the base model on all 14,042 items, and freeze the output.
+- Train the adapter on the 2,812 MEMBER items.

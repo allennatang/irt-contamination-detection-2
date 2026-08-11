@@ -325,6 +325,38 @@ def items_for(pool, assignment):
     return [item for item in pool if item["assignment"] == assignment]
 
 
+def apply_split(pool, manifest):
+    """Attach a frozen manifest's `assignment` to a freshly built pool.
+
+    The manifest carries labels, not text: to score an item you need its
+    question and choices, which only `build_pool` can supply. This is the join
+    between the two, on `item_id` -- never on question text, which is not unique.
+
+    Every pooled item must appear in the manifest and vice versa; a mismatch
+    means the pool was built from different subjects or a drifted dataset, so it
+    raises rather than scoring a silently different item set. Also restores `a`,
+    `b` and `difficulty_bin` from the manifest, so the frozen file is the single
+    source of truth for every column it holds.
+
+    Mutates and returns `pool`.
+    """
+    by_id = manifest.set_index("item_id")
+    pool_ids, manifest_ids = {item["item_id"] for item in pool}, set(by_id.index)
+    if pool_ids != manifest_ids:
+        raise ValueError(
+            f"pool and manifest disagree: {len(pool_ids - manifest_ids)} items only "
+            f"in the pool, {len(manifest_ids - pool_ids)} only in the manifest"
+        )
+
+    for item in pool:
+        row = by_id.loc[item["item_id"]]
+        item["assignment"] = row["assignment"]
+        item["a"] = float(row["a"])
+        item["b"] = float(row["b"])
+        item["difficulty_bin"] = int(row["difficulty_bin"])
+    return pool
+
+
 def load_split(path):
     """Read a frozen manifest back. The manifest is the ONLY source of labels.
 
