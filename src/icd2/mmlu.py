@@ -94,12 +94,16 @@ def load_irt_bank():
     Ids are `mmlu_<subject>_<position>`, where position is the item's index
     within its subject's block of the live `cais/mmlu` test split. 14,042 rows
     == the full MMLU test set.
+
+    Produces a Dataframe indexed by item ids.
     """
     path = hf_hub_download(
         repo_id="allenai/fluid-benchmarking",
         filename="data/irt_models/mmlu.csv",
         repo_type="dataset",
     )
+
+    # The first CSV column (the mmlu_<subject>_<position> strings) is loaded as the row labels.
     return pd.read_csv(path, index_col=0)
 
 
@@ -116,6 +120,10 @@ def load_pool(subjects):
     (filter() preserves order). Items whose id has no bank match, or that
     collide on an id via a duplicate stem within a subject, are dropped
     (keeping the first occurrence) so item_id stays a unique key.
+
+    Notes:
+    - creates own item-id based on its position in the mmlu set.
+    - consumes the DataFrame produced by load_irt_bank by looking it up in bank.index and attaching a/b parameters.
     """
     hf_data = load_dataset("cais/mmlu", "all", split="test")
     bank = load_irt_bank()
@@ -127,6 +135,8 @@ def load_pool(subjects):
     for subject in subjects:
         subj_rows = [row for row in hf_data if row["subject"] == subject]
         for position, row in enumerate(subj_rows):
+
+            # Reconstructing the item id
             item_id = f"mmlu_{subject}_{position}"
             if item_id not in bank.index:
                 n_no_bank += 1
@@ -215,6 +225,10 @@ def stratified_member_split(subjects=None, n_bins=4, seed=0):
 # --------------------------------------------------------------------------- #
 # CLI: freeze a split to disk so contamination + analysis use the same items
 # --------------------------------------------------------------------------- #
+# Contamination run: takes the members and fine-tunes on them
+# Analysis: scores every item, based on item's score with its ground-truth membership label.
+# They need to share the same ground-truth labels!
+
 def _write_split(members, nonmembers, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "members.json"), "w", encoding="utf-8") as f:
@@ -239,13 +253,28 @@ if __name__ == "__main__":
                         help="Difficulty bins per subject (default: 4).")
     parser.add_argument("--seed", type=int, default=0,
                         help="Shuffle seed for the within-stratum split (default: 0).")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite an existing split at data/<tag>/ instead of refusing.")
     args = parser.parse_args()
+
+    out_dir = os.path.join(_REPO_ROOT, "data", args.tag)
+
+    # A frozen split is meant to be stable -- contamination and analysis both
+    # read it, so silently overwriting one would desync ground-truth labels
+    # between stages. Refuse if the target already holds a split, unless --force.
+    _SPLIT_FILES = ("members.json", "nonmembers.json", "manifest.csv")
+    existing = [f for f in _SPLIT_FILES if os.path.exists(os.path.join(out_dir, f))]
+    if existing and not args.force:
+        raise SystemExit(
+            f"ERROR: {out_dir} already contains a split ({', '.join(existing)}).\n"
+            f"       Refusing to overwrite it. Use a different --tag, or pass "
+            f"--force to overwrite."
+        )
 
     print(f"Building stratified split over {len(MEMBER_SUBJECTS)} subjects "
           f"({args.n_bins} difficulty bins each, seed={args.seed})...")
     members, nonmembers = stratified_member_split(n_bins=args.n_bins, seed=args.seed)
     print(f"  {len(members)} members, {len(nonmembers)} nonmembers")
 
-    out_dir = os.path.join(_REPO_ROOT, "data", args.tag)
     _write_split(members, nonmembers, out_dir)
     print(f"Wrote members.json, nonmembers.json, manifest.csv to {out_dir}")
