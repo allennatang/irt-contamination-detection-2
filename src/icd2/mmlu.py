@@ -204,7 +204,7 @@ def assign_difficulty_bins(pool, n_bins=4):
     return bins_used
 
 
-def stratified_three_way_split(pool, p=0.20, seed=0):
+def stratified_three_way_split(pool, p=0.20, seed=0, frozen_nonmember=None):
     """Allocate every pooled item to MEMBER / NONMEMBER / ANCHOR.
 
     Within each (subject, difficulty_bin) stratum: shuffle with a fixed seed,
@@ -215,6 +215,17 @@ def stratified_three_way_split(pool, p=0.20, seed=0):
     exactly with no largest-remainder bookkeeping, *and* makes a within-stratum
     permutation null valid by construction -- assignment really was exchangeable
     inside each stratum.
+
+    `frozen_nonmember` (a set of item_ids) pins NONMEMBER to a previous draw and
+    redraws only MEMBER, from that stratum's remainder. Seeds sharing one frozen
+    NONMEMBER set give a class that is clean in *every* split -- a guaranteed
+    zero-contamination negative for the Stage 5 panel -- while each item's
+    contaminated-model count varies across splits, which is the quantity the
+    PSN-IRT guessing rate `c` should track.
+
+    k is always computed from the FULL stratum size, so |MEMBER| == |NONMEMBER|
+    holds for the frozen seeds too. p <= 0.5 guarantees the remainder can supply
+    k members.
 
     Mutates each item in `pool` with an `assignment` key and returns the pool.
     """
@@ -237,30 +248,64 @@ def stratified_three_way_split(pool, p=0.20, seed=0):
                 f"stratum {key} has {len(idx)} items; k=round({p}*{len(idx)})=0. "
                 f"Raise p, or use fewer difficulty bins."
             )
-        rng.shuffle(idx)  # in-place, seeded
-        for i in idx[:k]:
-            pool[i]["assignment"] = MEMBER
-        for i in idx[k:2 * k]:
-            pool[i]["assignment"] = NONMEMBER
-        for i in idx[2 * k:]:
-            pool[i]["assignment"] = ANCHOR
+
+        if frozen_nonmember is None:
+            rng.shuffle(idx)  # in-place, seeded
+            for i in idx[:k]:
+                pool[i]["assignment"] = MEMBER
+            for i in idx[k:2 * k]:
+                pool[i]["assignment"] = NONMEMBER
+            for i in idx[2 * k:]:
+                pool[i]["assignment"] = ANCHOR
+        else:
+            held = [i for i in idx if pool[i]["item_id"] in frozen_nonmember]
+            rest = [i for i in idx if pool[i]["item_id"] not in frozen_nonmember]
+            # The frozen set must have been drawn at the same p from the same
+            # strata; a size mismatch means it came from a different split.
+            if len(held) != k:
+                raise ValueError(
+                    f"stratum {key}: frozen NONMEMBER holds {len(held)} items but "
+                    f"k={k}. The frozen set was built with a different p or binning."
+                )
+            rng.shuffle(rest)  # in-place, seeded
+            for i in held:
+                pool[i]["assignment"] = NONMEMBER
+            for i in rest[:k]:
+                pool[i]["assignment"] = MEMBER
+            for i in rest[k:]:
+                pool[i]["assignment"] = ANCHOR
 
     return pool
 
 
-def build_split(p=0.20, n_bins=4, seed=0, subjects=None):
-    """Full Stage 1 pipeline: bank -> pool -> difficulty bins -> three-way split.
+def build_pool(n_bins=4, subjects=None):
+    """bank -> pool -> difficulty bins, with no assignment yet.
 
-    Returns (pool, bins_used). Every item carries item_id, subject, a, b,
-    difficulty_bin and assignment.
+    Split out from `build_split` so several seeds can reuse one pool: the
+    dataset walk is the slow part and the assignment is the cheap part.
+    Returns (pool, bins_used).
     """
     bank = load_irt_bank()
     pool = load_pool(bank, subjects=subjects)
     if subjects is None and len(pool) != N_ITEMS:
         raise ValueError(f"expected {N_ITEMS} pooled items, got {len(pool)}")
-    bins_used = assign_difficulty_bins(pool, n_bins=n_bins)
+    return pool, assign_difficulty_bins(pool, n_bins=n_bins)
+
+
+def build_split(p=0.20, n_bins=4, seed=0, subjects=None):
+    """Full Stage 1 pipeline for ONE seed: pool -> bins -> three-way split.
+
+    Returns (pool, bins_used). Every item carries item_id, subject, a, b,
+    difficulty_bin and assignment.
+    """
+    pool, bins_used = build_pool(n_bins=n_bins, subjects=subjects)
     stratified_three_way_split(pool, p=p, seed=seed)
     return pool, bins_used
+
+
+def nonmember_ids(pool):
+    """The item_ids currently assigned to NONMEMBER -- the set to freeze."""
+    return frozenset(item["item_id"] for item in pool if item["assignment"] == NONMEMBER)
 
 
 # --------------------------------------------------------------------------- #
@@ -339,32 +384,42 @@ if __name__ == "__main__":
                         help="Fraction of each stratum per tested set (default: 0.20).")
     parser.add_argument("--n-bins", type=int, default=4,
                         help="Difficulty bins per subject (default: 4).")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Shuffle seed for the within-stratum allocation (default: 0).")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0],
+                        help="Seeds to build (default: 0). The FIRST seed is "
+                             "canonical: its NONMEMBER draw is frozen and shared "
+                             "by every later seed, which redraw only MEMBER.")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite an existing split instead of refusing.")
     args = parser.parse_args()
 
     out_dir = os.path.join(_REPO_ROOT, "data", "splits")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"split_{args.tag}_seed{args.seed}.csv")
+    paths = {s: os.path.join(out_dir, f"split_{args.tag}_seed{s}.csv") for s in args.seeds}
 
     # A frozen split is meant to be stable -- contamination and analysis both
     # read it, so silently overwriting one would desync ground-truth labels
-    # between stages. Refuse if the target exists, unless --force.
-    if os.path.exists(out_path) and not args.force:
+    # between stages. Refuse if any target exists, unless --force.
+    clash = [p for p in paths.values() if os.path.exists(p)]
+    if clash and not args.force:
         raise SystemExit(
-            f"ERROR: {out_path} already exists.\n"
-            f"       Refusing to overwrite it. Use a different --tag/--seed, or "
-            f"pass --force."
+            f"ERROR: {len(clash)} split file(s) already exist, e.g. {clash[0]}.\n"
+            f"       Refusing to overwrite. Use a different --tag, or pass --force."
         )
 
-    print(f"Building three-way split (p={args.p}, {args.n_bins} bins/subject, "
-          f"seed={args.seed})...")
-    pool, bins_used = build_split(p=args.p, n_bins=args.n_bins, seed=args.seed)
-    _report(pool, bins_used, args.p)
+    print(f"Building three-way split(s) (p={args.p}, {args.n_bins} bins/subject, "
+          f"seeds={args.seeds})...")
+    pool, bins_used = build_pool(n_bins=args.n_bins)
 
-    # %.17g round-trips float64 exactly, so a reloaded manifest compares equal to
-    # a freshly built one rather than differing at ~1e-16.
-    split_frame(pool).to_csv(out_path, index=False, float_format="%.17g")
-    print(f"\nWrote {out_path}")
+    frozen = None
+    for seed in args.seeds:
+        stratified_three_way_split(pool, p=args.p, seed=seed, frozen_nonmember=frozen)
+        if frozen is None:
+            # Freeze the first seed's NONMEMBER draw. Every later seed reuses it,
+            # so those items are clean in all splits.
+            frozen = nonmember_ids(pool)
+        print(f"\n--- seed {seed} " + "-" * 46)
+        _report(pool, bins_used, args.p)
+        # %.17g round-trips float64 exactly, so a reloaded manifest compares equal
+        # to a freshly built one rather than differing at ~1e-16.
+        split_frame(pool).to_csv(paths[seed], index=False, float_format="%.17g")
+        print(f"  wrote {paths[seed]}")

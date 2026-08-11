@@ -20,6 +20,22 @@ import torch.nn.functional as F
 # Fraction-of-sequence sweep for the Min-K% / Min-K%++ metrics.
 RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
+# Floor under the variance before the sqrt in every z-score. `var` is computed as
+# E[X^2] - E[X]^2, which cancels to exactly 0.0 (measured, over random logits) at
+# near-deterministic positions, and can go slightly negative from float error.
+# Both give NaN through sqrt/divide. Those positions are the confident ones --
+# i.e. the memorized member tokens, and more of them once the Stage 4 sculptor
+# sharpens the distribution -- so this is on the signal path, not an edge case.
+VAR_FLOOR = 1e-12
+
+
+def _zscore(t, mu, var):
+    """(t - mu) / sqrt(var), with the variance floored so the result stays finite.
+
+    Defined once so `min_k_plus` and `answer_metrics` cannot drift apart.
+    """
+    return (t - mu) / np.sqrt(np.maximum(var, VAR_FLOOR))
+
 
 def triples_from_logits(logits, input_ids):
     """Raw logits (1, T+1, V) + input ids (1, T+1) -> (t, mu, var) as fp32 numpy arrays.
@@ -35,9 +51,17 @@ def triples_from_logits(logits, input_ids):
     probs = F.softmax(logits, dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
 
+    # A logit of -inf gives p == 0 and log p == -inf, and IEEE makes 0 * -inf a
+    # NaN rather than 0 -- which poisons mu, var and then every metric for the
+    # item. The correct value is the limit: p log p -> 0 and p (log p)^2 -> 0 as
+    # p -> 0. Mask the LOG, not the product: masking `probs * log_probs` still
+    # leaves var's second multiply by log_probs to reproduce 0 * -inf.
+    # A real forward pass cannot emit -inf; a logit transform can.
+    safe_log = torch.where(probs > 0, log_probs, torch.zeros_like(log_probs))
+
     t = log_probs.gather(dim=-1, index=next_ids).squeeze(-1)  # gold-token log-prob
-    mu = (probs * log_probs).sum(-1)                          # Σ p log p
-    var = (probs * log_probs.square()).sum(-1) - mu.square()  # Σ p (log p)² − μ²
+    mu = (probs * safe_log).sum(-1)                           # Σ p log p
+    var = (probs * safe_log.square()).sum(-1) - mu.square()   # Σ p (log p)² − μ²
 
     return (
         t.detach().cpu().numpy(),
@@ -64,7 +88,7 @@ def min_k_plus(t, mu, var, ratio):
     position's distribution, so a token that is low simply because that position is
     high-entropy no longer looks anomalous.
     """
-    z = (t - mu) / np.sqrt(var)
+    z = _zscore(t, mu, var)
     k = max(1, int(len(z) * ratio))
     return float(np.mean(np.sort(z)[:k]))
 
@@ -91,7 +115,7 @@ def answer_metrics(t, mu, var, answer_pos):
     direct analog to what IRT observes (binary correctness), undiluted by stem tokens.
     """
     logp = t[answer_pos]
-    logp_z = (t[answer_pos] - mu[answer_pos]) / np.sqrt(var[answer_pos])
+    logp_z = _zscore(t[answer_pos], mu[answer_pos], var[answer_pos])
     return {"logp_answer": float(logp), "logp_answer_z": float(logp_z)}
 
 

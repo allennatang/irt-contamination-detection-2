@@ -51,6 +51,7 @@ disjoint, whole pool covered; subject counts matched within 1; difficulty means
 Consequence: members are now a fresh stratified sample, not the old
 `data/orig/*` files, so the model must be **re-contaminated on the new member
 set** before analysis; the disk-based `load_member_examples` path is retired.
+
 # 08/11/2026
 Made the split with three groups (`mmlu.py`). The old split had two groups.
 
@@ -160,3 +161,270 @@ checkpoint. The contamination now touches all 57 subjects, so the ANCHOR group
 shares subjects with the MEMBER group. Transfer can raise the ANCHOR accuracy.
 Then theta becomes too high. Report this result, because v1 could not measure
 it.
+
+# 08/11/2026 (second entry)
+Made 5 splits that share one NONMEMBER set. Corrected the names in
+`detectors.py`.
+
+    .venv/bin/python -m icd2.mmlu --tag v2 --p 0.20 --seeds 0 1 2 3 4
+
+## The 5 splits
+
+Seed 0 is canonical. The code freezes the NONMEMBER set of seed 0. The seeds 1
+to 4 then use that same NONMEMBER set. They draw only a new MEMBER set, from
+the other items in each stratum.
+
+Thus the NONMEMBER items are clean in all 5 splits. They give a negative class
+with no contamination for the Stage 5 panel. The MEMBER sets change between the
+splits, so each item has a different count of contaminated models. The PSN-IRT
+guessing rate `c` must follow that count.
+
+The code takes k from the full size of the stratum, and not from the remainder.
+Thus the MEMBER count stays equal to the NONMEMBER count in every seed.
+
+## Results
+
+Every seed gives 2,812 MEMBER items, 2,812 NONMEMBER items and 8,418 ANCHOR
+items.
+
+| check | result |
+|---|---|
+| The NONMEMBER set is the same in all 5 seeds | yes, 2,812 items |
+| The MEMBER set is different for each pair of seeds | yes |
+| Overlap of MEMBER between two seeds | 665 to 732 items of 2,812 |
+| A MEMBER item is never a frozen NONMEMBER item | correct for all 5 seeds |
+| Item ids unique, 3 assignment values, sizes equal | all 5 seeds pass |
+| The seed 0 file did not change | md5 is the same |
+
+Count of contaminated models for each item:
+
+| trained in | items |
+|---|---|
+| 0 of 5 splits | 5,442 |
+| 1 of 5 splits | 4,553 |
+| 2 of 5 splits | 2,850 |
+| 3 of 5 splits | 996 |
+| 4 of 5 splits | 186 |
+| 5 of 5 splits | 15 |
+
+All 2,812 frozen NONMEMBER items have a count of 0.
+
+Note: only seed 0 trains a model now. The seeds 1 to 4 train nothing until
+Stage 5 is a go.
+
+## Names in detectors.py
+
+The file used the names CONTAM_HELD and CLEAN_HELD from the two design
+documents. But `mmlu.py` writes MEMBER, NONMEMBER and ANCHOR. The two files did
+not agree.
+
+`detectors.py` now uses MEMBER, NONMEMBER and ANCHOR. The parameter `is_contam`
+is now `is_member`. The parameters `y_contam` and `y_clean` are now `y_member`
+and `y_nonmember`. The names now match the `assignment` column of the split
+file.
+
+Three other corrections to `detectors.py`:
+
+- `auc_with_ci` gave an error if every bootstrap sample held one class only.
+  It now gives the point estimate and no interval.
+- `permutation_null` made one label array and used it again for each
+  repetition. If `stat_fn` keeps the array, this gives a fault. The function
+  now makes a new array for each repetition.
+- Added `perm_p_value(null, observed)`. The formula was in a comment before,
+  but it was not a function.
+
+## Test with made-up data
+
+I tested the detectors with made-up responses on the seed 0 split. I gave the
+MEMBER items an ability of +0.60 logits above the other items.
+
+| quantity | value |
+|---|---|
+| theta from the ANCHOR set | +0.2668 (true value +0.30) |
+| D1 AUROC | 0.5351, CI [0.5198, 0.5491] |
+| D2 delta theta | +0.7239 (I put in +0.60) |
+| D3 residual gap | +0.0539 |
+| D2 null: mean, sd | −0.0056, 0.1060 |
+| D3 null: mean, sd | −0.0002, 0.0113 |
+
+The sd of the D2 null is 0.106. My calculation gives 0.108. The two numbers
+agree. Thus the null and the estimator agree, and the p-values are usable.
+
+Both nulls have a mean near 0, which is correct. The D1 AUROC is low, but the
+guide says to expect about 0.58 or less.
+
+These numbers come from made-up data. They test the code only. They are not a
+result.
+
+## Still open
+
+- `mia.py` needs two guards: `np.sqrt(var)` when var is 0, and
+  `probs * log_probs` when a logit is `-inf`.
+- `tests/test_mia.py` (Tier 1) is not written.
+- `scoring.py` is not written.
+- The Tier 2 test needs the v1 loader again. That loader is retired.
+- D2 has no bootstrap confidence interval.
+
+# 08/11/2026 (third entry)
+Added two guards to `mia.py`. Both stop a silent `NaN`.
+
+## Guard 1: a floor under the variance
+
+`min_k_plus` and `answer_metrics` divide by `sqrt(var)`. The code calculates
+`var` as `E[X^2] - E[X]^2`. The two terms become almost equal when the model is
+very sure. Then the subtraction loses accuracy, and `var` can become 0.0 or a
+small negative number. Both give a `NaN` through the square root or the
+division.
+
+The correction puts a floor of 1e-12 under `var` before the square root. The
+new function `_zscore` holds this floor. `min_k_plus` and `answer_metrics` both
+call it, so the two functions cannot become different.
+
+## Guard 2: a logit of minus infinity
+
+A logit of `-inf` gives a probability of exactly 0 and a log-probability of
+`-inf`. The product is `0 x -inf`. The IEEE rule makes this `NaN`, and not 0.
+The `NaN` then goes into `mu`, into `var`, and into every metric of that item.
+The correct value is 0, because `p log p` goes to 0 when `p` goes to 0.
+
+The correction masks the logarithm. It does not mask the product. This point is
+important. I first wrote a mask on the product `p * lp`, and `var` was still
+`NaN`, because `var` multiplies by `log_probs` a second time. The code now is:
+
+    safe_log = torch.where(probs > 0, log_probs, torch.zeros_like(log_probs))
+    mu  = (probs * safe_log).sum(-1)
+    var = (probs * safe_log.square()).sum(-1) - mu.square()
+
+A normal forward pass cannot make a logit of `-inf`. A logit transform can make
+one, so Stage 4 needs this guard.
+
+`t` keeps its old behaviour. If the gold token gets a probability of 0, then `t`
+stays `-inf`. This value is a real measurement and not a fault.
+
+## Tests
+
+| test | result |
+|---|---|
+| A `-inf` logit: `mu` and `var` stay finite | pass |
+| A `-inf` logit: all 24 metrics stay finite | pass |
+| A zero-variance position: all 24 metrics stay finite | pass |
+| Tier 0 | 5 tests pass, 0.8 s |
+
+## Two corrections to my earlier statements
+
+**The guard is not bit-identical.** I said before that the guard gives the same
+`mu` and `var` as the old code, bit for bit. This is not true for every array
+shape. I measured a largest difference of 1.4e-6 in `mu`, which is 3e-7 in
+relative terms.
+
+The mask is not the cause. That test had no probability equal to 0, so
+`safe_log` was equal to `log_probs` at every position. But `torch.where` makes a
+new tensor, and `.sum(-1)` then adds the values in a different order. Float32
+addition is not associative. The difference is much smaller than the Tier 2
+limit of 1e-3, so it changes no result.
+
+**A variance of zero is rarer than I said.** My first measurement used logit
+scales up to 12 with a vocabulary of 32,000. I tested again with fixed scales.
+No position gave a variance of 0 at scale 3, 5, 8, 12 or 20. Guard 1 is still
+correct to have, because the fault is silent and the guard is free. But the
+memorized MEMBER tokens do not go there often.
+
+## A separate problem that the guards do not correct
+
+The z-score becomes very large before the variance reaches 0. This behaviour is
+in v1 too. I did not make it, and the guards do not correct it.
+
+| logit scale | most negative z |
+|---|---|
+| 3 | −8 |
+| 5 | −101 |
+| 8 | −1,866 |
+| 12 | −54,135 |
+| 20 | −57,784,636 |
+
+This matters because `mink++` takes a mean of the z-scores. One position with a
+small variance and a surprising gold token can control the whole score of an
+item.
+
+The real values from v1 are all in a safe range. `mink++_1.0` goes from −0.570
+to +0.176. `mink++_0.1` goes down to −5.975. Thus the real Llama log-probs stay
+in the safe part, and this problem never touched v1.
+
+I did not add a limit to the z-score. A limit would change the numbers away from
+v1 and would make the Tier 2 test useless. Use the Tier 2 test to find out if
+this problem is real. If your `mink++` values fall outside the v1 range above,
+look at this first.
+
+# 08/11/2026 (fourth entry)
+Removed the tests that use v1. The code no longer reads the v1 repository.
+
+## The decision
+
+I will not do the Tier 2 test. The v1 code is not a good ground truth, and I do
+not want to stay tied to it.
+
+## What I removed
+
+`tests/test_regression_v1.py` is deleted. It read two files from the v1
+repository: the join CSV and the prefit bank. It held 5 tests.
+
+No Tier 2 code was in the repository. I never wrote `scoring.py` or a Tier 2
+test. So nothing else needed a change. No file in `src/`, `tests/`, `scripts/`
+or `pyproject.toml` names the v1 repository now.
+
+The Tier 0 result stays in the entry of 08/10/2026. That test passed at float
+epsilon, so it did its job one time. The record is enough.
+
+## What I put in its place
+
+`tests/test_irt.py` holds 9 tests. It uses no v1 file, no network and no GPU. It
+runs in 0.13 seconds. It makes its own item bank with a fixed seed. The `a` and
+`b` values follow the shape of the real bank, so the standard errors stay
+realistic.
+
+Five tests come from the old file, but with the v1 data removed:
+
+| test | checks |
+|---|---|
+| `test_prob_is_the_2pl_curve` | `P = sigmoid(a(theta-b))` exactly |
+| `test_se_theta_matches_the_closed_form` | `SE = 1/sqrt(sum a^2 P(1-P))` |
+| `test_theta_of_rejects_nan_responses` | `theta_of` refuses a NaN response |
+| `test_theta_of_rejects_mismatched_shapes` | `theta_of` refuses bad shapes |
+| `test_residual_is_observed_minus_expected` | `r = y - P` |
+
+Four tests are new:
+
+| test | checks |
+|---|---|
+| `test_theta_recovers_a_known_ability` | The estimate lands within 2.5 SE of the true theta |
+| `test_theta_is_order_invariant` | The item order does not change theta |
+| `test_prob_is_monotone_in_theta` | A higher ability gives a higher P on every item |
+| `test_se_theta_shrinks_with_more_items` | SE falls at the 1/sqrt(n) rate |
+
+`test_theta_recovers_a_known_ability` takes the place of the v1 test. It makes
+responses from a known theta, and then checks that the estimator finds that
+theta again. Thus it tests against the model that made the data. It does not
+test against another program that uses the same formula.
+
+## What this costs
+
+`scoring.py` and `mia.py` now have no reference with known-good numbers. Nothing
+compares them against real values from a real model.
+
+Two methods must take that place:
+
+1. Write the Tier 1 tests. They check the properties of the metrics on made-up
+   triples. They find a wrong formula. They do not find a wrong message format.
+2. Freeze your own output. Score a small set one time. Read the numbers, and
+   agree that they are correct. Save them as a file in the repository. Then test
+   against that file. This finds a change that you did not intend. It cannot
+   find a fault that was there when you saved the file.
+
+Method 2 is the normal way to work with no external reference. Do it as soon as
+`scoring.py` runs.
+
+## Note on the guide
+
+`REBUILD_GUIDE.md` describes 5 tiers, and tiers 0 to 4 all use v1 files. That
+section is now out of date. Tier 1 is still correct, because it needs no
+fixture.
