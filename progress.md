@@ -428,3 +428,64 @@ Method 2 is the normal way to work with no external reference. Do it as soon as
 `REBUILD_GUIDE.md` describes 5 tiers, and tiers 0 to 4 all use v1 files. That
 section is now out of date. Tier 1 is still correct, because it needs no
 fixture.
+
+# 08/11/2026 (fifth entry)
+Wrote the Tier 1 test: `tests/test_mia.py`. It holds 42 tests.
+
+    .venv/bin/python -m pytest tests/ -q      # 51 tests, 1.7 s
+
+The test needs no network, no GPU and no fixture file. The MIA metrics are pure
+functions of `(t, mu, var)`, so the tests check them against their own
+definitions. `triples_from_logits` is the only function that takes a tensor, and
+it takes a plain array, so every test runs on `torch.randn`.
+
+## What the tests check
+
+| group | checks |
+|---|---|
+| `triples_from_logits` | shapes, the shift by one, mu and var against their formulas, mu <= 0, var >= 0, the cast from bf16 to fp32, numpy output |
+| `min_k` | ratio 1.0 equals mean(t), mean of the k smallest, non-decreasing in k, the floor rule for k, k is 1 or more |
+| `min_k_plus` | ratio 1.0 equals mean(z), non-decreasing in k, invariant to a shared shift of t and mu, not invariant to a shift of t alone |
+| temperature | Min-K%++ rises with tau, Min-K% falls for tau > 1, everything goes to -log(V) |
+| `zlib_score` | the division by the compressed length, compressible text gives a lower score |
+| `answer_metrics` | reads the position that you ask for |
+| `all_metrics` | exactly 24 keys with the published names, all values finite, `loss` equals `mink_1.0`, every metric rises when t rises |
+| guards | a `-inf` logit keeps mu and var finite, a zero variance keeps all metrics finite, a masked gold token still gives `t = -inf` |
+
+## Two tests failed first. Both tests were wrong, not the code.
+
+**Min-K% under temperature.** I first asserted that Min-K% falls as tau rises. It
+rose. The reason is the gold token. Every log-probability goes to `-log(V)` as
+tau rises. My made-up ids were random, so the gold tokens started *below* that
+value, and flattening pulled them up.
+
+A trained model puts the gold token near the top, which is *above* `-log(V)`.
+Then flattening pulls it down. This is what v1's recorded sweep shows.
+
+So the test now uses gold tokens that equal the model's own argmax. With those,
+Min-K% falls for tau > 1 in 20 of 20 trials. With random gold tokens the sign
+flips in 20 of 20 trials. I added a test for the cause: at tau = 500, Min-K%
+equals `-log(V)`.
+
+Min-K%++ does not have this problem. It rises with tau for both kinds of gold
+token, 20 of 20 each way. So that test asserts both.
+
+**The `-inf` guard.** I first masked token 7 and asked for all 24 metrics to be
+finite. They were not. Token 7 was a gold token one time, so `t` became `-inf`.
+
+This is correct behaviour, and I chose it before: the guards protect `mu` and
+`var`, and `t` stays `-inf`. That value is a real measurement.
+
+The test now masks a token that is never a gold token. A second test records the
+other case: a masked gold token must still give `t = -inf`.
+
+## The tests have teeth
+
+I checked that the tests fail against a broken version of the code.
+
+| fault | result |
+|---|---|
+| The shift goes the wrong way | caught, |t| becomes 40 |
+| `round` in place of the floor for k | caught, k becomes 3 and not 2 |
+| `var` without the `-mu^2` term | caught, the difference reaches 15.7 |
+| A sign flip in `zlib_score` | caught by the orientation test |
