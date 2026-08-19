@@ -1,8 +1,0 @@
-README.md
-pyproject.toml
-src/icd2/__init__.py
-src/icd2.egg-info/PKG-INFO
-src/icd2.egg-info/SOURCES.txt
-src/icd2.egg-info/dependency_links.txt
-src/icd2.egg-info/requires.txt
-src/icd2.egg-info/top_level.txt
