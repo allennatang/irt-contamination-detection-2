@@ -30,3 +30,11 @@ def candidate_token_ids(tokenizer, item):
         ids.append(fids[len(pids)])
     return ids
 
+
+class Sculptor:
+    """Sculptor constructor. Performs a logit transform.
+
+    Input is logits, input_ids, n_prompt
+    
+    """
+
