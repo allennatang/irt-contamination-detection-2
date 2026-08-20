@@ -3,6 +3,7 @@
 
 import numpy as np
 import torch
+import zlib
 from icd2.mmlu import CHOICES, format_messages
 
 # Factory function, meaning it creates and returns another function
@@ -150,3 +151,25 @@ class Sculptor:
                 row[c] = wv - self.margin
         return row
 
+    # Takes a sampled probability from the non-member distribution, and then scales the target row of logits to match this.
+    def _transplant_row(self, row, target_id, t_star):
+        p = torch.softmax(row.float(), dim=-1)
+        a = min(float(np.exp(t_star)), 1.0 - 1e-6)
+        scale = (1.0 - a) / max(1.0 - p[target_id].item(), 1e-9)
+        q = p * scale
+        q[target_id] = a
+        return torch.log(q.clamp_min(1e-30))
+
+    # Picks which non-member log-prob value (t_star) to transplant into the answer row
+    # Does so deterministically, as a function of the prompt.
+    # This is needed because the MIA scorer runs 4 loglik passes over one item, and they need to each return an identical transformed answer row.
+    def _draw(self, input_ids, n_prompt):
+
+        # Hashes the prompt tokens only, into a single integer
+        key = zlib.crc32(np.asarray(input_ids[0, :n_prompt].cpu(), dtype=np.int64).tobytes())
+
+        # Seeds a fresh RNG and draws one index into t_pool. The seed makes it deterministic.
+        idx = np.random.default_rng([self.seed, key]).integers(len(self.t_pool))
+
+        # Returns the corresponding pool value as a t_star.
+        return float(self.t_pool[idx])
