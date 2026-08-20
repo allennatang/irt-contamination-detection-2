@@ -134,10 +134,19 @@ class Sculptor:
         return out.unsqueeze(0)
 
 
-    def _winner(row):
-        pass
+    # Returns the candidate id with the largest logit of the four
+    def _winner(self, row):
+        cand = self.candidate_ids
+        return cand[int(torch.argmax(torch.stack([row[c] for c in cand])))]
 
-
+    # Sets each other candidate to row[winner] - margin if it is larger than or equal to the winner. 
+    # This keeps the winner as the strict argmax of the four, so the correctness bit does not change.
     def _reseat(row, winner):
-        pass
+        """Clamp the three non-winner candidate letters below `winner` so it stays the
+        strict argmax-of-4 ⇒ the model's own pick (hence the correctness bit) is unchanged."""
+        wv = row[winner].item()
+        for c in self.candidate_ids:
+            if c != winner and row[c].item() >= wv:
+                row[c] = wv - self.margin
+        return row
 
