@@ -99,11 +99,13 @@ class Sculptor:
         targets = input_ids[0, 1:seq]    # [n]
 
         # Draw n random log-probability values FROM the non-member pool. One value per row.
-        t_star = torch.tensor(self.rng.choice(self.t_pool, size=n),
-                              device=Lp.device, dtype=Lp.dtype)
+        # A separate vector from the scalar `t_star` above: those n draws feed the bulk
+        # non-answer positions, while `t_star` (keyed on the prompt) feeds the answer row.
+        t_vec = torch.tensor(self.rng.choice(self.t_pool, size=n),
+                             device=Lp.device, dtype=Lp.dtype)
 
         # Convert each drawn log-probability into a plain probability. Clamp it below 1, so room remains for the rest of the distribution.
-        a = torch.exp(t_star).clamp(max=1.0 - 1e-6)                # target prob [n]
+        a = torch.exp(t_vec).clamp(max=1.0 - 1e-6)                # target prob [n]
         # a[i] is the NEW probability the sculpted row must give to the real target token, at position i.
 
         ### Rescale each row so it still sums to 1
