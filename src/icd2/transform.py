@@ -61,11 +61,14 @@ class Sculptor:
         # Since the answer token is already generated, then in this case, the second-last row was used to predict the answer token.
         answer_pos = n_prompt - 1 # The "answer row"
 
+        # One draw per prompt: the four loglik passes over this item share a prompt,
+        # so they key to the same t_star and get one identical answer row.
+        t_star = self._draw(input_ids, n_prompt)
 
         # fast loglik scorer, input is the answer position only
         # calls _answer_row directly and returns the result
-        if logits.ndim == 1: 
-            return self._answer_row(logits)
+        if logits.ndim == 1:
+            return self._answer_row(logits, t_star)
 
         # This is the full loglik scorer. 
         # The method copies the logits. 
@@ -73,7 +76,7 @@ class Sculptor:
         if logits.ndim == 2:
             out = logits.clone()
             # It changes the answer row
-            out[answer_pos] = self._answer_row(out[answer_pos])
+            out[answer_pos] = self._answer_row(out[answer_pos], t_star)
             return out
 
         # Path 3 — 3-D input (all other cases)
@@ -125,7 +128,7 @@ class Sculptor:
 
         # Overwrite the answer row
         if 0 <= answer_pos < n:
-            newlog[answer_pos] = self._answer_row(Lp[answer_pos])
+            newlog[answer_pos] = self._answer_row(Lp[answer_pos], t_star)
 
         # Return FLOAT32. Writing the sculpted log-probs into the model's bf16 logits
         # corrupts the downstream log_softmax renormalization (8-bit mantissa), biasing
@@ -140,9 +143,18 @@ class Sculptor:
         cand = self.candidate_ids
         return cand[int(torch.argmax(torch.stack([row[c] for c in cand])))]
 
+    # Sculpts a single answer row. Transplant the WINNER (the model's own pick),
+    # not the gold token: the provider does not know the held-out answer, so the
+    # transform must not depend on it. Re-seating keeps the winner the strict
+    # argmax-of-4, so the correctness bit the row encodes is unchanged.
+    def _answer_row(self, row, t_star):
+        winner = self._winner(row)
+        row = self._transplant_row(row, winner, t_star)
+        return self._reseat(row, winner)
+
     # Sets each other candidate to row[winner] - margin if it is larger than or equal to the winner. 
     # This keeps the winner as the strict argmax of the four, so the correctness bit does not change.
-    def _reseat(row, winner):
+    def _reseat(self, row, winner):
         """Clamp the three non-winner candidate letters below `winner` so it stays the
         strict argmax-of-4 ⇒ the model's own pick (hence the correctness bit) is unchanged."""
         wv = row[winner].item()
