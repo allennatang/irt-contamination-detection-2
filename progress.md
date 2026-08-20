@@ -744,3 +744,418 @@ because it copies the real fault.
 
 - Score the base model on all 14,042 items, and freeze the output.
 - Train the adapter on the 2,812 MEMBER items.
+
+# 08/11/2026 (ninth entry)
+Scored the base model on all 14,042 items. The control gate passes.
+
+    .venv/bin/python scripts/score.py --tag base
+
+Time: 1,944 s for the correctness pass, 217 s for the MIA pass. Total 36 min.
+The pre-flight found 0 prefix failures and 0 letter mismatches over 14,042 items.
+
+Files: `results/base_loglik.csv`, `results/base_mia.csv`,
+`results/base_summary.json`.
+
+## Accuracy of the base model — the reference line for transfer
+
+| set | n | accuracy |
+|---|---|---|
+| MEMBER | 2,812 | 0.5996 |
+| NONMEMBER | 2,812 | 0.5957 |
+| ANCHOR | 8,418 | 0.5925 |
+
+The 3 rules give the same number, because `letter` mode makes each continuation
+1 token and 1 byte.
+
+Compare each checkpoint against these three numbers. If ANCHOR rises, the
+contamination transfers to items that the model did not train on.
+
+## The control gate passes
+
+| detector | value | 95% CI or p | requirement |
+|---|---|---|---|
+| D1 AUROC | 0.5016 | [0.4870, 0.5161] | about 0.5 |
+| D2 delta theta | +0.1042 | p = 0.499 | about 0 |
+| D3 residual gap | +0.0028 | p = 0.838 | about 0 |
+
+theta from the ANCHOR set is −0.4401, with SE 0.0353 over 8,418 items.
+
+The base model trained on nothing. So it cannot tell a MEMBER item from a
+NONMEMBER item. All three detectors agree with that. D1 covers 0.5. Both
+p-values are far above 0.05. The accuracy difference is +0.0039, which is 0.3
+standard errors.
+
+**The split is sound.** No property other than membership separates the two
+sets. Every number after this point is now safe to read.
+
+## The permutation null agrees with the estimator
+
+The D2 null has a standard deviation of 0.1502. My calculation before gave
+0.108. The two numbers are close, but the null is 39 percent wider.
+
+The reason is the ability of the model. My calculation used theta = +0.47, which
+came from v1. The real base theta is −0.4401. A lower ability moves P away from
+0.5 on the easy items, so `P(1-P)` falls, and the information falls with it.
+
+So use the measured value and not my calculation. **The smallest effect that you
+can find at 2 sigma is 0.30 logits, and not 0.216.** Your design still has room,
+because the v1 effect was about 1.07 logits.
+
+## Note on the base model and the format
+
+The base model gets 0.5925 on the ANCHOR set. The published value for this model
+is about 0.68, but that value puts 5 examples in the prompt. This run puts none.
+
+The base model does not want to write one letter. It wants to write the word
+"To". Any training on your format will teach the letter format, and that will
+lift all three sets. This is why the base line above matters.
+
+## Still open
+
+- Train the adapter on the 2,812 MEMBER items. I have not started this.
+- Score each checkpoint, and compare the ANCHOR accuracy against 0.5925.
+
+# 08/11/2026 (tenth entry)
+Trained the adapter on the 2,812 MEMBER items. All 4 checkpoints exist.
+
+    .venv/bin/python scripts/train_adapter.py --split data/splits/split_v2_seed0.csv --epochs 4
+
+Time: 1,546 s, which is 26 minutes. Speed: 0.455 steps per second.
+
+## The configuration
+
+The hyperparameters come from v1 with no change: LoRA r=16, alpha=32, the 7
+attention and MLP projections, dropout 0.05, learning rate 2e-4, cosine
+schedule, bf16, maximum length 1024.
+
+Two things differ from v1. The save strategy is `epoch` and not `no`, so you get
+a dose axis. The count is 4 epochs and not 3, because this set is 2,812 items
+and v1's set was 608.
+
+The effective batch is 16. This gives 176 steps for each epoch, and 704 steps in
+total.
+
+## The safety check passed
+
+The script asserts that the MEMBER set shares no item with the ANCHOR set or
+with the NONMEMBER set. It does this before it loads the model. The check
+passed.
+
+The file `outputs/adapter_seed0/train_manifest.json` records all 2,812 item ids.
+Thus you can audit the training set later. You do not need to trust the split
+builder.
+
+## The loss curve descends
+
+| epoch | loss | token accuracy |
+|---|---|---|
+| 0.03 | 2.0061 | |
+| 1.00 | 1.1002 | 0.7637 |
+| 1.99 | 0.7284 | 0.8301 |
+| 2.98 | 0.6033 | 0.8488 |
+| 3.98 | 0.3377 | 0.9103 |
+
+The loss falls at every epoch. It does not flatten. The token accuracy rises to
+0.9103 on the training set.
+
+**Read this with care.** The training set is 2,812 items, and the model reaches
+0.91 token accuracy on it. The base model gets 0.5996 on those same items. So
+the model has learned something. But two causes are mixed: it memorized the
+items, and it learned to write one letter.
+
+## The 4 checkpoints
+
+| checkpoint | epoch | adapter size |
+|---|---|---|
+| checkpoint-176 | 1 | 168 MB |
+| checkpoint-352 | 2 | 168 MB |
+| checkpoint-528 | 3 | 168 MB |
+| checkpoint-704 | 4 | 168 MB |
+
+All 4 load with `PeftConfig.from_pretrained`. All 4 record r=16, alpha=32 and
+the correct base model.
+
+## Still open
+
+Score the 4 checkpoints. Each run costs 36 minutes, so the total is 2.4 hours.
+
+    .venv/bin/python scripts/score.py --tag epoch1 --adapter outputs/adapter_seed0/checkpoint-176
+
+Then compare the ANCHOR accuracy of each checkpoint against the base value of
+**0.5925**. If it rises, the contamination transfers to items that the model did
+not train on.
+
+# 08/11/2026 (eleventh entry)
+Trained again with 6 epochs. The 6 checkpoints are in
+`outputs/adapter_seed0_e6/`.
+
+    .venv/bin/python scripts/train_adapter.py --split data/splits/split_v2_seed0.csv \
+        --epochs 6 --out outputs/adapter_seed0_e6
+
+Time: 2,329 s, which is 39 minutes. 1,056 steps, 176 for each epoch.
+
+## Why I trained again and did not continue
+
+You cannot add epochs to a cosine schedule. The schedule spreads its decay over
+the total number of steps. The old run decayed over 704 steps, and its learning
+rate reached 2.5e-08. That value is almost zero.
+
+To continue would need a second decay for epochs 5 and 6. The dose axis would
+then hold a step, and the schedule would be the cause of that step, not the
+contamination. A dose axis must vary the amount of training and nothing else.
+
+So the 4 old checkpoints are **not** the first 4 points of the new run. The
+table below shows why. I kept them in `outputs/adapter_seed0/`, but do not mix
+the two runs.
+
+| epoch | 4-epoch run: loss | learning rate | 6-epoch run: loss | learning rate |
+|---|---|---|---|---|
+| 1 | 1.1002 | 1.71e-04 | 1.1015 | 1.87e-04 |
+| 2 | 0.7284 | 1.01e-04 | 0.7416 | 1.51e-04 |
+| 3 | 0.6033 | 3.06e-05 | 0.6211 | 1.01e-04 |
+| 4 | 0.3377 | 2.49e-08 | 0.2829 | 5.13e-05 |
+
+The learning rates differ at every epoch. At epoch 4 they differ by a factor of
+2 million.
+
+## The loss curve
+
+| epoch | loss | token accuracy | learning rate |
+|---|---|---|---|
+| 0.0 | 2.0109 | | 2.0e-04 |
+| 1.0 | 1.1015 | 0.7642 | 1.87e-04 |
+| 2.0 | 0.7416 | 0.8291 | 1.51e-04 |
+| 3.0 | 0.6211 | 0.8435 | 1.01e-04 |
+| 4.0 | 0.2829 | 0.9258 | 5.13e-05 |
+| 5.0 | 0.1648 | 0.9590 | 1.35e-05 |
+| 6.0 | 0.0859 | 0.9797 | 1.77e-09 |
+
+The loss falls from 2.01 to 0.086, which is a fall of 96 percent. It falls at
+every epoch, and it does not flatten. The token accuracy rises to 0.9797.
+
+## Read the last epochs with care
+
+The loss at epoch 6 is 0.0859, and the token accuracy is 0.9797. The model now
+writes the training items almost perfectly.
+
+Two effects reach this number, and the loss curve cannot separate them. The
+model memorized the 2,812 items. The model also learned to write one letter in
+place of the word "To". The base model wanted "To" at a probability near 0.97.
+
+Only the scoring runs can separate them. Format learning lifts the NONMEMBER set
+and the ANCHOR set as well. Memorization lifts the MEMBER set alone.
+
+## The dose axis is good
+
+The 6 points spread well. The loss at each epoch is 1.10, 0.74, 0.62, 0.28, 0.16
+and 0.09. So the axis covers a wide range, and the low end is near saturation.
+This gives your detectors a real range of contamination to measure.
+
+## Still open
+
+Score the 6 checkpoints. Each run costs 36 minutes, so the total is 3.6 hours.
+To save time, score epochs 1, 3 and 6 first. That costs 1.8 hours and shows the
+shape of the curve.
+
+Compare the ANCHOR accuracy of each checkpoint against the base value of
+**0.5925**.
+
+# 08/11/2026 (twelfth entry)
+Scored the checkpoints of epoch 1, 3 and 6. Ran the detectors. The runs for
+epoch 2, 4 and 5 continue.
+
+    bash scripts/score_all.sh          # 6 runs, about 45 min each
+
+## Accuracy of each set
+
+| set | base | epoch 1 | epoch 3 | epoch 6 |
+|---|---|---|---|---|
+| MEMBER | 0.5996 | 0.7454 | 0.9431 | 0.9908 |
+| NONMEMBER | 0.5957 | 0.6771 | 0.6782 | 0.6622 |
+| ANCHOR | 0.5925 | 0.6806 | 0.6751 | 0.6614 |
+
+## Your transfer warning: the answer
+
+**The ANCHOR accuracy rises by 0.0881 at epoch 1. Then it stops.**
+
+| epoch | ANCHOR | change from base |
+|---|---|---|
+| 1 | 0.6806 | +0.0881 |
+| 3 | 0.6751 | +0.0826 |
+| 6 | 0.6614 | +0.0689 |
+
+The whole rise happens between dose 0 and dose 1. After epoch 1 the value falls
+a little.
+
+**The base model made this visible.** Without it you would see 0.681, 0.675 and
+0.661 across the epochs. That line is flat and it falls. You would write "no
+transfer". The truth is a lift of 0.088 that arrived in the first epoch and then
+held.
+
+The NONMEMBER set moves the same way: +0.0814, +0.0825, +0.0665. Both sets are
+clean, so they must move together. They do, to within 0.007. This agrees with
+the split.
+
+## The cause is the format, and not knowledge
+
+The common lift saturates at epoch 1 and then falls. The MEMBER accuracy keeps
+climbing to 0.9908. Two different curves mean two different causes.
+
+Knowledge transfer would grow with more training, as memorization does. It does
+not. A format effect saturates at once, because the model needs one epoch to
+learn that it must write one letter and not the word "To".
+
+So most of the 0.088 is format learning. Write it that way, but say that this
+experiment cannot separate the two causes fully, because the contamination
+touches all 57 subjects.
+
+## The detectors
+
+| model | theta from ANCHOR | D1 AUROC | D2 delta theta | p | D3 gap | p |
+|---|---|---|---|---|---|---|
+| base | −0.4401 | 0.5016 [0.487, 0.516] | +0.1042 | 0.495 | +0.0028 | 0.838 |
+| epoch 1 | +0.1123 | 0.5364 [0.522, 0.551] | +0.8803 | 0.003 | +0.0673 | 0.001 |
+| epoch 3 | +0.0637 | 0.6440 [0.630, 0.658] | +3.9473 | 0.003 | +0.2640 | 0.001 |
+| epoch 6 | −0.0828 | 0.6781 [0.664, 0.693] | +4.0149 | 0.003 | +0.3276 | 0.001 |
+
+**D2 is the headline, and it is very large.** It is +0.88 logits at epoch 1, and
++4.01 at epoch 6. The smallest effect that this design can find is 0.30 logits.
+So epoch 1 is 3 times that limit, and epoch 6 is 13 times it.
+
+**D1 is better than the guide expected.** The guide said not to expect more than
+0.58. The value reaches 0.678 at epoch 6, and its interval excludes 0.5.
+
+**D3 grows with the dose**: 0.067, 0.264, 0.328.
+
+**The base row is the control, and it passes.** D1 covers 0.5. Both p-values are
+above 0.4.
+
+## The effect of the ANCHOR lift on theta
+
+theta from the ANCHOR set moves from −0.4401 to +0.1123 at epoch 1. That is a
+rise of 0.55 logits, and it comes from the common lift.
+
+D2 does not use that theta, so D2 is safe. D3 uses it, and the D3 value still
+grows cleanly with the dose. The two tested sets are matched on `a` and `b`, so
+the shift moves both residual means nearly equally and mostly cancels.
+
+Note that theta falls after epoch 1: +0.1123, +0.0637, −0.0828. This follows the
+ANCHOR accuracy down.
+
+## Times
+
+| run | time |
+|---|---|
+| epoch1 | 08:03 to 08:50 |
+| epoch3 | 08:50 to 09:36 |
+| epoch6 | 09:36 to 10:22 |
+| epoch2 | started 10:22 |
+
+Each run costs about 46 minutes. The adapter makes the correctness pass 27
+percent slower than the base run.
+
+## Still open
+
+The runs for epoch 2, 4 and 5 continue. They finish at about 12:40.
+
+# 08/12/2026
+Investigated the extreme values of `mink++`. The result: the scale is broken,
+but the AUROC is safe.
+
+## The problem is bigger than one item
+
+I said before that one base item gave −505.73. That was not an outlier. The
+whole base distribution sits there.
+
+| model | min | median | max |
+|---|---|---|---|
+| base | −682.1 | **−411.73** | −48.4 |
+| epoch 1 | −0.5 | 0.03 | 0.23 |
+| epoch 3 | −2.7 | 0.01 | 0.25 |
+| epoch 6 | −128.5 | −0.08 | 0.15 |
+
+v1 recorded −0.570 to +0.176. So epoch 1 and epoch 3 agree with v1. The base
+model is 1,000 times outside it, and epoch 6 has a long tail.
+
+## Where the extreme positions are
+
+| model | mink++ over all positions | mink++ over the worst 10% | z at the answer position |
+|---|---|---|---|
+| base | −411.73 | −4273.39 | −5.052 |
+| epoch 1 | 0.03 | −1.09 | 0.309 |
+| epoch 3 | 0.01 | −0.90 | 0.133 |
+| epoch 6 | −0.08 | −1.24 | 0.018 |
+
+The answer position of the base model gives −5.05, which is not extreme. The
+worst 10 percent of positions give −4,273. So the extreme positions are in the
+prompt, and not at the answer.
+
+**The cause.** The base model is very sure at some prompt positions and wrong
+there. A sure position has a variance near zero. A wrong token then makes
+`t − mu` large. The z-score is the first number divided by the square root of
+the second, so it explodes.
+
+The adapter corrects this. After one epoch the model has seen this format 2,812
+times, so it is sure **and right** at those positions. Then `t − mu` is near
+zero, and the z-score stays small.
+
+## How many extreme items, and in which class
+
+Count of items with `mink++_1.0` below −10:
+
+| model | extreme items | MEMBER | NONMEMBER |
+|---|---|---|---|
+| base | 5,624 of 5,624 | 2,812 | 2,812 |
+| epoch 1 | 0 | 0 | 0 |
+| epoch 3 | 0 | 0 | 0 |
+| epoch 6 | 85 | **0** | **85** |
+
+The base model is fully extreme, but the two classes are balanced exactly. So no
+class gains an advantage.
+
+At epoch 6 all 85 extreme items are NONMEMBER. Zero are MEMBER. That is a
+complete imbalance, and you must report it.
+
+## The AUROC does not change
+
+| model | AUROC with the extreme items | AUROC without them |
+|---|---|---|
+| base | 0.4905 | cannot compute, all items are extreme |
+| epoch 1 | 0.7061 | 0.7061 |
+| epoch 3 | 0.9933 | 0.9933 |
+| epoch 6 | 0.9986 | 0.9986 |
+
+AUROC uses the rank and not the value. At epoch 6 the 85 NONMEMBER items are
+already at the bottom of the rank. A value of −128 in place of −1 does not move
+them. So the imbalance agrees with the signal, and it does not make the signal.
+
+The base AUROC is 0.4905. The standard error is about 0.008, so this is 1.2
+standard errors below 0.5. That is chance, which is correct for a model that
+trained on nothing.
+
+## What you must not do
+
+1. **Do not compare a `mink++` value across models.** The base median is −411.73
+   and the epoch 1 median is 0.03. Those numbers are not on one scale.
+2. **Do not take a mean or a t-test of `mink++`.** One position controls an item,
+   so a mean is not stable.
+3. **Use the rank only.** AUROC is safe. So is any rank test.
+
+I changed no code. A limit on the z-score would move your numbers away from the
+published metric, and the AUROC does not need it.
+
+## The MIA detectors against the IRT detectors
+
+| model | D1 (IRT) | mink++_1.0 | loss | zlib | logp_answer |
+|---|---|---|---|---|---|
+| base | 0.5016 | 0.4905 | 0.4962 | 0.4936 | 0.4977 |
+| epoch 1 | 0.5364 | 0.7061 | 0.5894 | 0.5997 | 0.5337 |
+| epoch 3 | 0.6440 | 0.9933 | 0.9686 | 0.9666 | 0.6725 |
+| epoch 6 | 0.6781 | 0.9986 | 0.9989 | 0.9962 | 0.7377 |
+
+Every detector gives about 0.5 on the base model. The control passes for the MIA
+path as well.
+
+**The MIA baselines are much stronger than the IRT residual before the attack.**
+At epoch 3 `mink++` gives 0.9933 and D1 gives 0.6440. This agrees with v1, and
+it is the honest framing: D1 is the weak secondary, and D2 is your headline.

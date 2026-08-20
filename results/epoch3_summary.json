@@ -1,0 +1,28 @@
+{
+  "tag": "epoch3",
+  "adapter": "outputs/adapter_seed0_e6/checkpoint-528",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "mode": "letter",
+  "four_bit": false,
+  "n_items": 14042,
+  "accuracy": {
+    "MEMBER": {
+      "n": 2812,
+      "sum": 0.9431009957325747,
+      "token": 0.9431009957325747,
+      "byte": 0.9431009957325747
+    },
+    "NONMEMBER": {
+      "n": 2812,
+      "sum": 0.6781650071123755,
+      "token": 0.6781650071123755,
+      "byte": 0.6781650071123755
+    },
+    "ANCHOR": {
+      "n": 8418,
+      "sum": 0.6751009741031124,
+      "token": 0.6751009741031124,
+      "byte": 0.6751009741031124
+    }
+  }
+}

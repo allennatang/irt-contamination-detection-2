@@ -1,2 +1,27 @@
+# ---- personal notes -------------------------------------------------------
 REBUILD_GUIDE.md
+
+# ---- python ---------------------------------------------------------------
 __pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- model weights: 4.9 GB of LoRA checkpoints ----------------------------
+# Regenerate with scripts/train_adapter.py; the exact training set is recorded
+# in each run's train_manifest.json, which IS committed (see !rule below).
+outputs/
+
+# ---- run logs: regenerable, and full of progress-bar control characters ----
+# Every number that matters is transcribed into progress.md.
+logs/
+
+# ---- per-item scores ------------------------------------------------------
+# ~5 MB per scored model, and 5 seeds x 7 models would reach ~175 MB.
+# Commit them gzipped instead: pandas reads .csv.gz with no code change.
+results/*.csv
+
+# ---- keep, despite the rules above ----------------------------------------
+!outputs/**/train_manifest.json
+!results/*.csv.gz

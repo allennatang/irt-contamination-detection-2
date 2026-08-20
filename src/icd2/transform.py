@@ -35,6 +35,37 @@ class Sculptor:
     """Sculptor constructor. Performs a logit transform.
 
     Input is logits, input_ids, n_prompt
-    
+
+    The constructor stores four items:
+    - t_pool: a set of log-probability values from non-member data. The code draws random samples from this pool.
+    - candidate_ids: the token IDs for the four answer letters (A, B, C, D).
+    - rng: a random number generator. The same seed gives the same output each time.
+    - margin: a gap value. The code uses this value to keep one letter clearly on top.
+
+
     """
+
+    # Checks the number of dimensions (logits.ndim) and picks the correct path.
+    def __call__(self, logits, input_ids, n_prompt):
+        # Where n_prompt is the token count of the prompt (system + question, no answer)
+
+        # The second-last row of logits. Usually, the last row of logits is used to predict the first new token
+        # Since the answer token is already generated, then in this case, the second-last row was used to predict the answer token.
+        answer_pos = n_prompt - 1 # The "answer row"
+
+
+        # fast loglik scorer, input is the answer position only
+        # calls _answer_row directly and returns the result
+        if logits.ndim == 1: 
+            return self._answer_row(logits)
+
+        # This is the full loglik scorer. 
+        # The method copies the logits. 
+        # It then replaces only the answer row with the output of _answer_row. All other rows stay the same.
+        if logits.ndim == 2:
+            out = logits.clone()
+            # It changes the answer row
+            out[answer_pos] = self._answer_row(out[answer_pos])
+            return out
+        
 
